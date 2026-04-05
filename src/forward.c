@@ -2182,8 +2182,6 @@ void reply_query(int fd, time_t now)
 	  }
 	}
 
-      }
-
     recursive_reply:
       header->hb4 |= HB4_RA;
 
@@ -2215,6 +2213,7 @@ void reply_query(int fd, time_t now)
 
       return_reply(now, forward, header, n, STAT_OK);
       return;
+      }
     }
 
   filter_servers(forward->sentto->arrayposn, F_SERVER, &first, &last);
