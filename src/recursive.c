@@ -1243,7 +1243,9 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
              eventloop blocking - this function runs synchronously) */
           pfd.fd = fd;
           pfd.events = POLLIN;
-          if (poll(&pfd, 1, 250) > 0 && (pfd.revents & POLLIN))
+          { int poll_ret;
+            do poll_ret = poll(&pfd, 1, 250); while (poll_ret == -1 && errno == EINTR);
+          if (poll_ret > 0 && (pfd.revents & POLLIN))
             {
               union mysockaddr from_addr;
               socklen_t from_len = sizeof(from_addr);
@@ -1259,6 +1261,7 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
                     }
                 }
             }
+          }
 
           close(fd);
         }
