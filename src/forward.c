@@ -671,6 +671,9 @@ static size_t decompress_rdata(struct dns_header *header, size_t plen,
   unsigned char *olimit = out + outlen;
   char name[MAXDNAME];
 
+  if (!CHECK_LEN(header, rdata, plen, rdlen))
+    return 0;
+
   switch (type)
     {
     case T_NS:
@@ -705,6 +708,7 @@ static size_t decompress_rdata(struct dns_header *header, size_t plen,
       if (!op || op + 1 >= olimit) return 0;
       *op++ = 0;
       if (op + 20 > olimit) return 0;
+      if (!CHECK_LEN(header, p, plen, 20)) return 0;
       memcpy(op, p, 20);
       op += 20;
       return (size_t)(op - out);
@@ -2021,6 +2025,9 @@ void reply_query(int fd, time_t now)
 		  fp += 2;
 		  GETLONG(rr_ttl, fp);
 		  GETSHORT(rr_rdlen, fp);
+
+		  if (!CHECK_LEN(header, fp, (size_t)n, rr_rdlen))
+		    break;
 
 		  if (rr_type != T_CNAME)
 		    {
