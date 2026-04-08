@@ -1151,26 +1151,31 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
 
       if ((type == T_A && rdlen == INADDRSZ) || (type == T_AAAA && rdlen == IN6ADDRSZ))
         {
-          struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
-          if (rs)
-            {
-              memset(&rs->addr, 0, sizeof(rs->addr));
-              if (type == T_A)
-                {
-                  rs->addr.in.sin_family = AF_INET;
-                  rs->addr.in.sin_port = htons(NAMESERVER_PORT);
-                  memcpy(&rs->addr.in.sin_addr, p, INADDRSZ);
-                }
-              else
-                {
-                  rs->addr.in6.sin6_family = AF_INET6;
-                  rs->addr.in6.sin6_port = htons(NAMESERVER_PORT);
-                  memcpy(&rs->addr.in6.sin6_addr, p, IN6ADDRSZ);
-                }
-              rs->next = servers;
-              servers = rs;
-              count++;
-            }
+          if (!CHECK_LEN(header, p, plen, rdlen))
+            break;
+
+          {
+            struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
+            if (rs)
+              {
+                memset(&rs->addr, 0, sizeof(rs->addr));
+                if (type == T_A)
+                  {
+                    rs->addr.in.sin_family = AF_INET;
+                    rs->addr.in.sin_port = htons(NAMESERVER_PORT);
+                    memcpy(&rs->addr.in.sin_addr, p, INADDRSZ);
+                  }
+                else
+                  {
+                    rs->addr.in6.sin6_family = AF_INET6;
+                    rs->addr.in6.sin6_port = htons(NAMESERVER_PORT);
+                    memcpy(&rs->addr.in6.sin6_addr, p, IN6ADDRSZ);
+                  }
+                rs->next = servers;
+                servers = rs;
+                count++;
+              }
+          }
         }
 
       if (!ADD_RDLEN(header, p, plen, rdlen))
