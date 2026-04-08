@@ -1,10 +1,10 @@
 # DNSMASQ RootDNS Edition
 
-**Iterative DNS Resolution from Root Servers — No Forwarders Required**
+**Iterative DNS Resolution from Root Servers. No Forwarders Required**
 
 A modified version of [dnsmasq](http://www.thekelleys.org.uk/dnsmasq/doc.html) (v2.92) that resolves DNS queries **directly against the DNS root servers**, implementing the iterative resolution algorithm defined in [RFC 1034 §5.3.3](https://www.rfc-editor.org/rfc/rfc1034).
 
-Speeds up DNS resolution by up to **4×** compared to public resolvers — once the delegation cache is warm, most queries skip root and TLD lookups entirely. No third-party resolver dependency, no centralized query logging, no DNS-based censorship. Queries are distributed across authoritative servers — no single entity sees your full resolution profile. DNSSEC validation is fully supported but optional (`--wipe-dnssec`).
+Speeds up DNS resolution by up to **4×** compared to public resolvers. Once the delegation cache is warm, most queries skip root and TLD lookups entirely. No third-party resolver dependency, no centralized query logging, no DNS-based censorship. Queries are distributed across authoritative servers.  No single entity sees your full resolution profile. DNSSEC validation is fully supported but optional (`--wipe-dnssec`).
 
 ```
 Traditional dnsmasq:
@@ -27,11 +27,11 @@ dnsmasq-Root (with pre-loaded root zone):
 make            # just build it and have fun
 make help       # see all build targets and options
 
-# Run — resolves iteratively from root servers
+# Run. Resolves iteratively from root servers
 dnsmasq --forward-rootDNS --cache-size=50000
 ```
 
-For full-featured builds with DNSSEC, DBus, IDN2, and more, see [Building](#building).
+For full-featured builds with DNSSEC, DBus, IDN2 and more, see [Building](#building).
 
 ---
 
@@ -69,13 +69,13 @@ dnsmasq --forward-rootDNS --with-root-hints=/etc/dnsmasq/named.root
 
 ### `--with-root-zone=<path>`
 
-Pre-load the entire root zone into the delegation cache at startup. Eliminates root server queries entirely — every lookup starts directly at the TLD nameservers. Download from [InterNIC](https://www.internic.net/domain/root.zone).
+Pre-load the entire root zone into the delegation cache at startup. Eliminates root server queries entirely. Every lookup starts directly at the TLD nameservers. Download from [InterNIC](https://www.internic.net/domain/root.zone).
 
 ```bash
 dnsmasq --forward-rootDNS --with-root-zone=/etc/dnsmasq/root.zone
 ```
 
-At startup, the parser reads all A/AAAA glue records, groups NS records by zone, resolves NS hostnames to IPs, and stores ~1,500 TLD delegations in the delegation cache.
+At startup, the parser reads all A/AAAA glue records, groups NS records by zone, resolves NS hostnames to IPs and stores ~1,500 TLD delegations in the delegation cache.
 
 ### `--with-root-priming`
 
@@ -134,13 +134,13 @@ Number of hash buckets for the delegation cache. Default: **4096**, minimum: 64.
 
 ### `--iterative-async=<N>`
 
-Maximum number of concurrent asynchronous NS resolutions. When the iterative resolver encounters out-of-bailiwick NS names (nameserver hostnames without glue records), it must resolve those names before it can continue the delegation chain. By default, this is done asynchronously — a sub-query is dispatched and the event loop continues serving other clients while the NS name is resolved in the background.
+Maximum number of concurrent asynchronous NS resolutions. When the iterative resolver encounters out-of-bailiwick NS names (nameserver hostnames without glue records), it must resolve those names before it can continue the delegation chain. By default, this is done asynchronously. A sub-query is dispatched and the event loop continues serving other clients while the NS name is resolved in the background.
 
 | Value | Behavior |
 |-------|----------|
-| 0     | Synchronous only — blocks the event loop during NS resolution |
+| 0     | Synchronous only. Blocks the event loop during NS resolution |
 | 1     | One async resolution at a time |
-| **2** (default) | **Recommended** — up to 2 concurrent async NS resolutions |
+| **2** (default) | **Recommended**. Up to 2 concurrent async NS resolutions |
 | 3–10  | Higher concurrency (diminishing returns above 3) |
 
 Default: **2** (auto-enabled with `--forward-rootDNS`). Set to **0** to force synchronous NS resolution.
@@ -159,13 +159,13 @@ These two options are often confused but solve completely different problems:
 |---|---|---|
 | **Purpose** | Send the same query to multiple upstream **forwarders** simultaneously | Resolve NS hostnames concurrently during **iterative** resolution |
 | **Mode** | Forwarder mode (`--server=8.8.8.8 --server=1.1.1.1`) | Iterative mode (`--forward-rootDNS`) |
-| **What it parallelizes** | Identical queries to competing forwarders — fastest answer wins | Sub-queries for out-of-bailiwick NS names within a single delegation chain |
+| **What it parallelizes** | Identical queries to competing forwarders. Fastest answer wins | Sub-queries for out-of-bailiwick NS names within a single delegation chain |
 | **Goal** | Reduce latency by racing forwarders against each other | Keep the event loop responsive while resolving NS hostnames that lack glue records |
 | **Typical use case** | Multiple ISP resolvers or public DNS services configured | Iterative resolution from root servers |
 
-**`--all-servers`** is a standard dnsmasq option for **forwarder mode**. When you configure multiple upstream servers (`--server=8.8.8.8 --server=1.1.1.1`), dnsmasq normally picks one. With `--all-servers`, it sends the query to **all** of them and returns whichever answer arrives first. This is pure forwarder racing — dnsmasq does no resolution itself.
+**`--all-servers`** is a standard dnsmasq option for **forwarder mode**. When you configure multiple upstream servers (`--server=8.8.8.8 --server=1.1.1.1`), dnsmasq normally picks one. With `--all-servers`, it sends the query to **all** of them and returns whichever answer arrives first. This is pure forwarder racing. dnsmasq does no resolution itself.
 
-**`--iterative-async=<N>`** is a RootDNS option for **iterative mode**. During iterative resolution, the resolver sometimes encounters NS records that point to hostnames without accompanying IP addresses (no glue). Before it can continue the delegation chain, it must resolve those NS hostnames — a completely separate DNS lookup. With `--iterative-async`, these sub-lookups run asynchronously so the event loop can serve other clients in the meantime.
+**`--iterative-async=<N>`** is a RootDNS option for **iterative mode**. During iterative resolution, the resolver sometimes encounters NS records that point to hostnames without accompanying IP addresses (no glue). Before it can continue the delegation chain, it must resolve those NS hostnames. A completely separate DNS lookup. With `--iterative-async`, these sub-lookups run asynchronously so the event loop can serve other clients in the meantime.
 
 ```
 --all-servers (forwarder mode):
@@ -176,13 +176,13 @@ These two options are often confused but solve completely different problems:
 
 --iterative-async (iterative mode):
   Client query "example.com"
-    → root says: ask ns1.tld-servers.net (no glue — IP unknown)
+    → root says: ask ns1.tld-servers.net (no glue, IP unknown)
       → async sub-query: resolve ns1.tld-servers.net  ← runs in background
       → event loop continues serving other clients
       → sub-query returns IP → continue delegation chain
 ```
 
-**They are mutually exclusive by design.** `--all-servers` requires `--server=` forwarders. `--iterative-async` requires `--forward-rootDNS`. Using both makes no sense — if you resolve iteratively, there are no forwarders to race.
+**They are mutually exclusive by design.** `--all-servers` requires `--server=` forwarders. `--iterative-async` requires `--forward-rootDNS`. Using both makes no sense. If you resolve iteratively, there are no forwarders to race.
 
 ---
 
@@ -206,7 +206,7 @@ The >10,000 warning is suppressed when `--forward-rootDNS` is active, since larg
 
 ### Delegation Cache (`--deleg-cache-size`)
 
-New cache for NS delegation paths — which nameservers are authoritative for which zones:
+New cache for NS delegation paths. Which nameservers are authoritative for which zones:
 
 ```
 "com"         → {192.5.6.30, 192.33.14.30, ...}
@@ -316,10 +316,10 @@ make help    # show all available targets and flags
 | Target              | Description                                          |
 |---------------------|------------------------------------------------------|
 | `make`              | Standard build, no external dependencies             |
-| `make debian`       | Debian/Ubuntu — all features (DNSSEC, DBus, IDN2, conntrack, nftset, Lua) |
+| `make debian`       | Debian/Ubuntu. All features (DNSSEC, DBus, IDN2, conntrack, nftset, Lua) |
 | `make debian-hardened` | + FORTIFY_SOURCE, stack protector, PIE, full RELRO, LTO |
 | `make debian-native`   | + native CPU tuning                               |
-| `make freebsd`      | FreeBSD — all features (DNSSEC, DBus, IDN2, Lua)     |
+| `make freebsd`      | FreeBSD. All features (DNSSEC, DBus, IDN2, Lua)     |
 | `make freebsd-hardened` | + security hardening, LTO                        |
 
 ### Build Dependencies
@@ -341,13 +341,13 @@ Binary output: `src/dnsmasq`
 
 ## References
 
-- [RFC 1034](https://www.rfc-editor.org/rfc/rfc1034) — Domain Names: Concepts and Facilities (§5.3.3: Iterative Resolution)
-- [RFC 4033](https://www.rfc-editor.org/rfc/rfc4033) — DNS Security Introduction and Requirements (DNSSEC)
-- [RFC 4035](https://www.rfc-editor.org/rfc/rfc4035) — Protocol Modifications for DNSSEC
-- [RFC 8109](https://www.rfc-editor.org/rfc/rfc8109) — Initializing a DNS Resolver with Priming Queries
+- [RFC 1034](https://www.rfc-editor.org/rfc/rfc1034): Domain Names: Concepts and Facilities (§5.3.3: Iterative Resolution)
+- [RFC 4033](https://www.rfc-editor.org/rfc/rfc4033): DNS Security Introduction and Requirements (DNSSEC)
+- [RFC 4035](https://www.rfc-editor.org/rfc/rfc4035): Protocol Modifications for DNSSEC
+- [RFC 8109](https://www.rfc-editor.org/rfc/rfc8109): Initializing a DNS Resolver with Priming Queries
 - [IANA Root Servers](https://www.iana.org/domains/root/servers)
 - [InterNIC Root Zone](https://www.internic.net/domain/root.zone)
-- [dnsmasq](http://www.thekelleys.org.uk/dnsmasq/doc.html) — Original project by Simon Kelley
+- [dnsmasq](http://www.thekelleys.org.uk/dnsmasq/doc.html): Original project by Simon Kelley
 
 ## License
 
