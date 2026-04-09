@@ -1122,8 +1122,10 @@ static size_t build_dns_query(unsigned char *buf, size_t buflen, const char *nam
 }
 
 /* Extract A/AAAA addresses from the answer section of a DNS response.
-   Returns a referral_server list, or NULL if no addresses found. */
-struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen)
+   Returns a referral_server list, or NULL if no addresses found.
+   If owner_filter is non-NULL, only addresses whose owner name exactly
+   matches owner_filter are accepted. Pass NULL for unfiltered behaviour. */
+struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter)
 {
   unsigned char *p;
   int i;
@@ -1149,7 +1151,8 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
       p += 4; /* TTL */
       GETSHORT(rdlen, p);
 
-      if ((type == T_A && rdlen == INADDRSZ) || (type == T_AAAA && rdlen == IN6ADDRSZ))
+      if (((type == T_A && rdlen == INADDRSZ) || (type == T_AAAA && rdlen == IN6ADDRSZ)) &&
+          (owner_filter == NULL || hostname_isequal(name, owner_filter)))
         {
           if (!CHECK_LEN(header, p, plen, rdlen))
             break;
@@ -1282,7 +1285,7 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
       /* Check if we got an answer */
       if (RCODE(resp_header) == NOERROR && ntohs(resp_header->ancount) > 0)
         {
-          struct referral_server *result = extract_addresses_from_answer(resp_header, (size_t)n);
+          struct referral_server *result = extract_addresses_from_answer(resp_header, (size_t)n, ns_name);
           free_referral_servers(target_servers);
           if (result && option_bool(OPT_LOG))
             my_syslog(LOG_INFO, _("recursive: resolved NS name '%s' successfully"), ns_name);

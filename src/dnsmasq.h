@@ -2033,7 +2033,7 @@ struct referral_server *deleg_cache_lookup(const char *name, time_t now);
 int referral_zone_name(struct dns_header *header, size_t plen, char *zone, size_t zone_len);
 int is_referral(struct dns_header *header, size_t plen);
 struct referral_server *parse_referral(struct dns_header *header, size_t plen, const char *zone, unsigned long *ns_ttl_out);
-struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen);
+struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter);
 void free_referral_servers(struct referral_server *servers);
 int recursive_validate_source(struct frec *forward, union mysockaddr *addr);
 struct referral_server *resolve_ns_name_sync(const char *ns_name);

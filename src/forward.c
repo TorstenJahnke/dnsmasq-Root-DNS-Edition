@@ -905,7 +905,13 @@ static void async_ns_complete(struct frec *sub, struct dns_header *header, ssize
     }
 
   if (RCODE(header) == NOERROR && ntohs(header->ancount) > 0)
-    new_servers = extract_addresses_from_answer(header, (size_t)n);
+    {
+      const char *ns_owner = (parent->async_ns_current >= 0 &&
+                              parent->async_ns_current < parent->async_ns_count)
+                              ? parent->async_ns_names[parent->async_ns_current]
+                              : NULL;
+      new_servers = extract_addresses_from_answer(header, (size_t)n, ns_owner);
+    }
 
   if (new_servers)
     {
@@ -1775,31 +1781,34 @@ void reply_query(int fd, time_t now)
 				  daemon->namebuff, cname_target);
 
 		      entry = whine_malloc(sizeof(struct cname_chain));
-		      if (entry)
+		      if (!entry)
 			{
-			  safe_strncpy(entry->source, daemon->namebuff, MAXDNAME);
-			  safe_strncpy(entry->target, cname_target, MAXDNAME);
-			  entry->ttl = cname_ttl;
-			  entry->next = NULL;
-			  if (!forward->cname_chain)
-			    forward->cname_chain = entry;
-			  else
-			    {
-			      struct cname_chain *tail = forward->cname_chain;
-			      while (tail->next) tail = tail->next;
-			      tail->next = entry;
-			    }
+			  my_syslog(LOG_WARNING, _("recursive: out of memory tracking CNAME chain for %s"),
+				    daemon->namebuff);
+			  goto cname_chase_fail;
+			}
+		      safe_strncpy(entry->source, daemon->namebuff, MAXDNAME);
+		      safe_strncpy(entry->target, cname_target, MAXDNAME);
+		      entry->ttl = cname_ttl;
+		      entry->next = NULL;
+		      if (!forward->cname_chain)
+			forward->cname_chain = entry;
+		      else
+			{
+			  struct cname_chain *tail = forward->cname_chain;
+			  while (tail->next) tail = tail->next;
+			  tail->next = entry;
 			}
 
 		      if (!forward->cname_original)
 			{
-			  unsigned short orig_type;
+			  unsigned short orig_type = 0;
 			  forward->cname_original = forward->stash;
 			  forward->cname_original_len = forward->stash_len;
 			  {
-			    struct dns_header *orig_hdr = (struct dns_header *)daemon->packet;
-			    blockdata_retrieve(forward->stash, forward->stash_len, (void *)orig_hdr);
-			    extract_request(orig_hdr, forward->stash_len, daemon->namebuff, &orig_type, NULL);
+			    struct dns_header *orig_hdr = blockdata_retrieve(forward->stash, forward->stash_len, NULL);
+			    if (orig_hdr)
+			      extract_request(orig_hdr, forward->stash_len, daemon->namebuff, &orig_type, NULL);
 			    forward->cname_original_type = orig_type;
 			  }
 			  forward->stash = NULL;
@@ -1899,7 +1908,7 @@ void reply_query(int fd, time_t now)
 		      query_p = (unsigned char *)(header + 1);
 		      query_p = do_rfc1035_name(query_p, cname_target, NULL);
 		      if (!query_p)
-			goto recursive_reply;
+			goto cname_chase_fail;
 		      *query_p++ = 0;
 		      PUTSHORT(qtype, query_p);
 		      PUTSHORT(C_IN, query_p);
@@ -1909,7 +1918,7 @@ void reply_query(int fd, time_t now)
 			blockdata_free(forward->stash);
 		      forward->stash = blockdata_alloc((char *)header, new_qlen);
 		      if (!forward->stash)
-			goto recursive_reply;
+			goto cname_chase_fail;
 		      forward->stash_len = new_qlen;
 
 		      if (!option_bool(OPT_NO_0x20) && option_bool(OPT_DO_0x20))
@@ -1935,7 +1944,7 @@ void reply_query(int fd, time_t now)
 			    {
 			      my_syslog(LOG_WARNING, _("recursive: failed to send query for CNAME target '%s'"),
 					cname_target);
-			      goto recursive_reply;
+			      goto cname_chase_fail;
 			    }
 
 			  return;
@@ -1973,7 +1982,7 @@ void reply_query(int fd, time_t now)
 				{
 				  my_syslog(LOG_WARNING, _("recursive: failed to send query for CNAME target '%s'"),
 					    cname_target);
-				  goto recursive_reply;
+				  goto cname_chase_fail;
 				}
 
 			      return;
@@ -1982,7 +1991,7 @@ void reply_query(int fd, time_t now)
 			    {
 			      my_syslog(LOG_WARNING, _("recursive: no root servers for CNAME target '%s'"),
 					cname_target);
-			      goto recursive_reply;
+			      goto cname_chase_fail;
 			    }
 			}
 		    }
@@ -2189,6 +2198,25 @@ void reply_query(int fd, time_t now)
 	  }
 	}
 
+    cname_chase_fail:
+      {
+        struct blockdata *src_bd = forward->cname_original ? forward->cname_original : forward->stash;
+        size_t src_len = forward->cname_original ? forward->cname_original_len : forward->stash_len;
+
+        if (src_bd && src_len >= sizeof(struct dns_header) && src_len <= (size_t)daemon->edns_pktsz)
+          {
+            struct dns_header *eh = (struct dns_header *)daemon->packet;
+            blockdata_retrieve(src_bd, src_len, (void *)eh);
+            eh->hb3 |= HB3_QR;
+            SET_RCODE(eh, SERVFAIL);
+            eh->ancount = htons(0);
+            eh->nscount = htons(0);
+            eh->arcount = htons(0);
+            header = eh;
+            n = (ssize_t)src_len;
+          }
+      }
+      /* fall through */
     recursive_reply:
       header->hb4 |= HB4_RA;
 
