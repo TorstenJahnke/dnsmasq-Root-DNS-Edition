@@ -183,7 +183,7 @@ static void forward_query(int udpfd, union mysockaddr *udpaddr,
   struct server *master;
   unsigned int gotname;
   int old_src = 0, old_reply = 0;
-  int first, last, start = 0;
+  int first = 0, last = 0, start = 0;
   int forwarded = 0;
   int ede = EDE_UNSET;
   unsigned short rrtype, rrclass;
@@ -811,7 +811,28 @@ static int resolve_ns_name_async(struct frec *parent, char ns_names[][MAXDNAME],
     {
       cached = deleg_cache_lookup(ns_names[j], now);
       if (!cached)
-	continue;
+	{
+	  /* Cold-cache fallback: start the sub-resolution at the root
+	     servers so that an unknown NS hostname can still be looked
+	     up without an immediate hard SERVFAIL. */
+	  struct server *srv;
+	  int root_count = 0;
+
+	  for (srv = daemon->servers; srv && root_count < DELEGATION_MAX_ADDRS; srv = srv->next)
+	    if (srv->domain_len == 0 && !(srv->flags & SERV_LITERAL_ADDRESS))
+	      {
+		struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
+		if (!rs)
+		  break;
+		rs->addr = srv->addr;
+		rs->next = cached;
+		cached = rs;
+		root_count++;
+	      }
+
+	  if (!cached)
+	    continue;
+	}
 
       if (option_bool(OPT_LOG))
 	my_syslog(LOG_INFO, _("recursive: starting async resolution for NS '%s'"),
@@ -2040,17 +2061,27 @@ void reply_query(int fd, time_t now)
 
 		  if (rr_type != T_CNAME)
 		    {
-		      size_t new_rdlen = decompress_rdata(header, (size_t)n, rr_type,
-							  fp, rr_rdlen,
-							  final_rrs[rr_count].rdata,
-							  MAX_RDATA_SIZE);
-		      if (new_rdlen > 0 || rr_rdlen == 0)
+		      int is_dnssec_rr = (rr_type == T_RRSIG ||
+					  rr_type == T_NSEC ||
+					  rr_type == T_NSEC3 ||
+					  rr_type == T_NSEC3PARAM ||
+					  rr_type == T_DNSKEY ||
+					  rr_type == T_DS);
+
+		      if (!(option_bool(OPT_CNAME_FLAT) && is_dnssec_rr))
 			{
-			  safe_strncpy(final_rrs[rr_count].name, rr_name, MAXDNAME);
-			  final_rrs[rr_count].ttl = rr_ttl;
-			  final_rrs[rr_count].type = rr_type;
-			  final_rrs[rr_count].rdlen = (unsigned short)new_rdlen;
-			  rr_count++;
+			  size_t new_rdlen = decompress_rdata(header, (size_t)n, rr_type,
+							      fp, rr_rdlen,
+							      final_rrs[rr_count].rdata,
+							      MAX_RDATA_SIZE);
+			  if (new_rdlen > 0 || rr_rdlen == 0)
+			    {
+			      safe_strncpy(final_rrs[rr_count].name, rr_name, MAXDNAME);
+			      final_rrs[rr_count].ttl = rr_ttl;
+			      final_rrs[rr_count].type = rr_type;
+			      final_rrs[rr_count].rdlen = (unsigned short)new_rdlen;
+			      rr_count++;
+			    }
 			}
 		    }
 
@@ -2071,6 +2102,8 @@ void reply_query(int fd, time_t now)
 
 	    combined->hb3 |= HB3_QR;
 	    combined->hb4 |= HB4_RA;
+	    if (option_bool(OPT_CNAME_FLAT))
+	      combined->hb4 &= ~HB4_AD;
 	    SET_RCODE(combined, NOERROR);
 	    combined->nscount = htons(0);
 	    combined->arcount = htons(0);
@@ -3511,7 +3544,7 @@ unsigned char *tcp_request(int confd, time_t now,
   unsigned char *pheader;
   unsigned int mark = 0;
   int have_mark = 0;
-  int first, last, filtered, do_stale = 0;
+  int first = 0, last = 0, filtered = 0, do_stale = 0;
       
   if (!packet || getpeername(confd, (struct sockaddr *)&peer_addr, &peer_len) == -1)
     return packet;

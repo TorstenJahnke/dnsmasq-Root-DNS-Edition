@@ -176,7 +176,6 @@ void deleg_cache_store(const char *zone, struct referral_server *servers, time_t
    Returns a newly allocated referral_server list, or NULL if no match. */
 struct referral_server *deleg_cache_lookup(const char *name, time_t now)
 {
-  struct delegation_entry *entry;
   struct referral_server *servers = NULL, *rs;
   const char *lookup;
   int i;
@@ -188,18 +187,30 @@ struct referral_server *deleg_cache_lookup(const char *name, time_t now)
   for (lookup = name; lookup && *lookup; )
     {
       unsigned int h = deleg_hash(lookup);
+      struct delegation_entry **ep = &daemon->deleg_cache[h];
 
-      for (entry = daemon->deleg_cache[h]; entry; entry = entry->next)
+      while (*ep)
 	{
-	  if (hostname_isequal(entry->zone, lookup) && entry->expires > now)
+	  struct delegation_entry *cur = *ep;
+
+	  if (cur->expires <= now)
 	    {
-	      /* Found a valid cached delegation - build server list */
-	      for (i = 0; i < entry->addr_count; i++)
+	      /* Drop expired entries we encounter during the walk so that
+		 dead buckets do not keep consuming cache capacity. */
+	      *ep = cur->next;
+	      free(cur);
+	      daemon->deleg_cache_entries--;
+	      continue;
+	    }
+
+	  if (hostname_isequal(cur->zone, lookup))
+	    {
+	      for (i = 0; i < cur->addr_count; i++)
 		{
 		  rs = whine_malloc(sizeof(struct referral_server));
 		  if (rs)
 		    {
-		      rs->addr = entry->addrs[i];
+		      rs->addr = cur->addrs[i];
 		      rs->next = servers;
 		      servers = rs;
 		    }
@@ -211,9 +222,11 @@ struct referral_server *deleg_cache_lookup(const char *name, time_t now)
 
 	      return servers;
 	    }
+
+	  ep = &cur->next;
 	}
 
-      /* Move up one label: "www.example.com" → "example.com" → "com" */
+      /* Move up one label: "www.example.com" -> "example.com" -> "com" */
       lookup = strchr(lookup, '.');
       if (lookup)
 	lookup++; /* skip the dot */
@@ -1188,39 +1201,58 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
   return servers;
 }
 
-/* Synchronously resolve an NS name by sending iterative UDP queries.
-   Uses the delegation cache for starting servers, follows referrals,
-   returns resolved addresses as referral_server list.
-   This handles the out-of-bailiwick case where a delegation response
-   contains NS records (e.g., ns1.google.com) but no glue records
-   because the NS names are outside the delegated zone. */
-struct referral_server *resolve_ns_name_sync(const char *ns_name)
+/* Build a freshly-allocated list of root servers from daemon->servers.
+   Used as a cold-start fallback when the delegation cache has no entry
+   for an out-of-bailiwick NS name. */
+static struct referral_server *build_root_server_list(void)
+{
+  struct referral_server *head = NULL;
+  struct server *s;
+  int count = 0;
+
+  for (s = daemon->servers; s && count < DELEGATION_MAX_ADDRS; s = s->next)
+    if (s->domain_len == 0 && !(s->flags & SERV_LITERAL_ADDRESS))
+      {
+        struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
+        if (!rs)
+          break;
+        rs->addr = s->addr;
+        rs->next = head;
+        head = rs;
+        count++;
+      }
+  return head;
+}
+
+/* Core of the synchronous NS-name resolver, parameterised on the query
+   type. Tries the delegation cache, falls back to the root servers on
+   miss, then iterates referrals until it gets a definitive answer or
+   runs out of iterations. */
+static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsigned short qtype)
 {
   struct referral_server *target_servers, *rs;
-  ALIGNED(sizeof(u16)) unsigned char query_buf[1280]; /* enough for query + EDNS */
-  ALIGNED(sizeof(u16)) unsigned char resp_buf[4096]; /* response buffer */
+  ALIGNED(sizeof(u16)) unsigned char query_buf[1280];
+  ALIGNED(sizeof(u16)) unsigned char resp_buf[4096];
   size_t qlen;
   int iteration;
   time_t now = time(NULL);
 
-  if (option_bool(OPT_LOG))
-    my_syslog(LOG_INFO, _("recursive: resolving out-of-bailiwick NS name '%s'"), ns_name);
-
-  /* Build A query for the NS name */
-  qlen = build_dns_query(query_buf, sizeof(query_buf), ns_name, T_A);
+  qlen = build_dns_query(query_buf, sizeof(query_buf), ns_name, qtype);
   if (!qlen)
     return NULL;
 
-  /* Find starting servers from delegation cache */
   target_servers = deleg_cache_lookup(ns_name, now);
   if (!target_servers)
     {
-      /* No delegation cache entry - would need root servers.
-         For now, return NULL; the main query will retry later
-         when delegations are cached from other queries. */
+      target_servers = build_root_server_list();
+      if (!target_servers)
+        {
+          if (option_bool(OPT_LOG))
+            my_syslog(LOG_INFO, _("recursive: no delegation cache or root servers for NS name '%s'"), ns_name);
+          return NULL;
+        }
       if (option_bool(OPT_LOG))
-        my_syslog(LOG_INFO, _("recursive: no cached delegation for NS name '%s'"), ns_name);
-      return NULL;
+        my_syslog(LOG_INFO, _("recursive: cold-cache NS '%s', starting from root"), ns_name);
     }
 
   for (iteration = 0; iteration < 10; iteration++)
@@ -1231,14 +1263,12 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
       struct dns_header *resp_header;
       int got_response = 0;
 
-      /* Try each server until we get a response */
       for (rs = target_servers; rs && !got_response; rs = rs->next)
         {
           fd = socket(rs->addr.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
           if (fd == -1)
             continue;
 
-          /* Update query ID for each attempt */
           ((struct dns_header *)query_buf)->id = htons(rand16());
 
           if (sendto(fd, query_buf, qlen, 0, &rs->addr.sa, sa_len(&rs->addr)) < 0)
@@ -1247,8 +1277,6 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
               continue;
             }
 
-          /* Wait for response with 250ms timeout (reduced from 2s to minimize
-             eventloop blocking - this function runs synchronously) */
           pfd.fd = fd;
           pfd.events = POLLIN;
           { int poll_ret;
@@ -1282,17 +1310,13 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
 
       resp_header = (struct dns_header *)resp_buf;
 
-      /* Check if we got an answer */
       if (RCODE(resp_header) == NOERROR && ntohs(resp_header->ancount) > 0)
         {
           struct referral_server *result = extract_addresses_from_answer(resp_header, (size_t)n, ns_name);
           free_referral_servers(target_servers);
-          if (result && option_bool(OPT_LOG))
-            my_syslog(LOG_INFO, _("recursive: resolved NS name '%s' successfully"), ns_name);
           return result;
         }
 
-      /* Check if this is a referral - follow it */
       if (is_referral(resp_header, (size_t)n))
         {
           char zone[MAXDNAME];
@@ -1301,35 +1325,54 @@ struct referral_server *resolve_ns_name_sync(const char *ns_name)
           zone[0] = '\0';
           referral_zone_name(resp_header, (size_t)n, zone, sizeof(zone));
 
-          /* Try to get glue from this referral (might be in-bailiwick at this level) */
           {
             unsigned long sync_ns_ttl = 0;
             new_servers = parse_referral(resp_header, (size_t)n, zone, &sync_ns_ttl);
             if (!new_servers)
-              {
-                /* Still no glue - try without bailiwick restriction for this sub-resolution */
-                new_servers = parse_referral(resp_header, (size_t)n, NULL, &sync_ns_ttl);
-              }
+              new_servers = parse_referral(resp_header, (size_t)n, NULL, &sync_ns_ttl);
 
             if (new_servers)
               {
-                /* Cache this delegation with TTL from referral NS records */
                 if (zone[0] != '\0')
                   deleg_cache_store(zone, new_servers, (time_t)sync_ns_ttl);
 
-              free_referral_servers(target_servers);
-              target_servers = new_servers;
-              continue;
-            }
+                free_referral_servers(target_servers);
+                target_servers = new_servers;
+                continue;
+              }
           }
         }
 
-      /* NXDOMAIN or other error */
       break;
     }
 
   free_referral_servers(target_servers);
   return NULL;
+}
+
+/* Synchronously resolve an NS name by sending iterative UDP queries.
+   Uses the delegation cache (or root-server fallback) for starting
+   servers, follows referrals, returns resolved addresses as a
+   referral_server list. Tries IPv4 first, then IPv6 on miss, so that
+   IPv6-only NS hostnames are reachable.
+   This handles the out-of-bailiwick case where a delegation response
+   contains NS records (e.g., ns1.google.com) but no glue records
+   because the NS names are outside the delegated zone. */
+struct referral_server *resolve_ns_name_sync(const char *ns_name)
+{
+  struct referral_server *result;
+
+  if (option_bool(OPT_LOG))
+    my_syslog(LOG_INFO, _("recursive: resolving out-of-bailiwick NS name '%s'"), ns_name);
+
+  result = resolve_ns_name_qtype(ns_name, T_A);
+  if (!result)
+    result = resolve_ns_name_qtype(ns_name, T_AAAA);
+
+  if (result && option_bool(OPT_LOG))
+    my_syslog(LOG_INFO, _("recursive: resolved NS name '%s' successfully"), ns_name);
+
+  return result;
 }
 
 /* Extract NS target names from the authority section of a referral response.
@@ -1391,8 +1434,8 @@ int extract_cname_target(struct dns_header *header, size_t plen,
   if (!(p = skip_questions(header, plen)))
     return 0;
 
-  /* Extract the queried name to start the chain */
-  extract_request(header, plen, current_name, NULL, NULL);
+  if (extract_request(header, plen, current_name, NULL, NULL) == 0)
+    return 0;
 
   for (i = 0; i < ntohs(header->ancount); i++)
     {
