@@ -779,16 +779,134 @@ static int forward_to_referrals(struct frec *forward, time_t now)
   return sent;
 }
 
-static int resolve_ns_name_async(struct frec *parent, char ns_names[][MAXDNAME],
-				 int ns_count, const char *zone, time_t now)
+/* Build the starting referral_server list for an async NS sub-query:
+   uses the delegation cache if available, otherwise falls back to the
+   root servers. Returned list is freshly allocated and owned by the
+   caller. */
+static struct referral_server *start_ns_cached_or_root(const char *ns_name, time_t now)
 {
-  struct frec *sub;
+  struct referral_server *cached = deleg_cache_lookup(ns_name, now);
+
+  if (!cached)
+    {
+      struct server *srv;
+      int root_count = 0;
+
+      for (srv = daemon->servers; srv && root_count < DELEGATION_MAX_ADDRS; srv = srv->next)
+	if (srv->domain_len == 0 && !(srv->flags & SERV_LITERAL_ADDRESS))
+	  {
+	    struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
+	    if (!rs)
+	      break;
+	    rs->addr = srv->addr;
+	    rs->next = cached;
+	    cached = rs;
+	    root_count++;
+	  }
+    }
+
+  return cached;
+}
+
+/* Create an asynchronous sub-query frec for the given NS name and query
+   type, wire it up as parent's async_child, kick it off via
+   forward_to_referrals, and record the current phase on the parent.
+   Returns 1 if the sub is in flight, 0 on any creation/forwarding
+   failure (in which case the parent's async_child/phase are left clean
+   for the caller to try the next name). */
+static int start_ns_subquery(struct frec *parent, const char *ns_name,
+			     unsigned short qtype, time_t now)
+{
   struct referral_server *cached;
+  struct frec *sub;
   struct dns_header *header;
   unsigned char *p;
   size_t qlen;
-  int j;
   struct server dummy_serv;
+
+  cached = start_ns_cached_or_root(ns_name, now);
+  if (!cached)
+    return 0;
+
+  if (option_bool(OPT_LOG))
+    my_syslog(LOG_INFO, _("recursive: starting async resolution for NS '%s' (qtype %u)"),
+	      ns_name, (unsigned)qtype);
+
+  memset(&dummy_serv, 0, sizeof(dummy_serv));
+  sub = get_new_frec(now, &dummy_serv, 1);
+  if (!sub)
+    {
+      free_referral_servers(cached);
+      return 0;
+    }
+
+  header = (struct dns_header *)daemon->packet;
+  memset(header, 0, sizeof(struct dns_header));
+  sub->new_id = get_id();
+  header->id = htons(sub->new_id);
+  header->hb3 = HB3_RD;
+  header->qdcount = htons(1);
+
+  p = (unsigned char *)(header + 1);
+  p = do_rfc1035_name(p, ns_name, NULL);
+  if (!p)
+    {
+      free_referral_servers(cached);
+      free_frec(sub);
+      return 0;
+    }
+  *p++ = 0;
+  PUTSHORT(qtype, p);
+  PUTSHORT(C_IN, p);
+  qlen = (size_t)(p - (unsigned char *)header);
+
+  sub->flags = FREC_RECURSIVE | FREC_NS_ASYNC;
+  sub->stash = blockdata_alloc((char *)header, qlen);
+  if (!sub->stash)
+    {
+      free_referral_servers(cached);
+      free_frec(sub);
+      return 0;
+    }
+  sub->stash_len = qlen;
+  sub->referral_servers = cached;
+  sub->recursive_iteration = 1;
+  sub->recursive_prev_zone[0] = '\0';
+  sub->cname_chain = NULL;
+  sub->cname_original = NULL;
+  sub->cname_chase_count = 0;
+  sub->async_parent = parent;
+  sub->async_child = NULL;
+  sub->async_ns_count = 0;
+
+  sub->frec_src.fd = -1;
+  sub->frec_src.orig_id = 0;
+  sub->frec_src.log_id = daemon->log_id;
+  sub->frec_src.next = NULL;
+  sub->frec_src.encode_bitmap = (!option_bool(OPT_NO_0x20) && option_bool(OPT_DO_0x20)) ? rand32() : 0;
+  sub->frec_src.encode_bigmap = NULL;
+  if (sub->frec_src.encode_bitmap)
+    extract_name(header, qlen, NULL, (char *)&sub->frec_src.encode_bitmap, EXTR_NAME_FLIP, 1);
+
+  parent->async_child = sub;
+  parent->async_ns_phase = (qtype == T_AAAA) ? 1 : 0;
+
+  if (forward_to_referrals(sub, now))
+    {
+      daemon->async_ns_in_flight++;
+      return 1;
+    }
+
+  parent->async_child = NULL;
+  sub->async_parent = NULL;
+  free_frec(sub);
+  return 0;
+}
+
+static int resolve_ns_name_async(struct frec *parent, char ns_names[][MAXDNAME],
+				 int ns_count, const char *zone, time_t now)
+{
+  int j;
 
   if (daemon->iterative_async_limit <= 0)
     return 0;
@@ -806,106 +924,21 @@ static int resolve_ns_name_async(struct frec *parent, char ns_names[][MAXDNAME],
     safe_strncpy(parent->async_ns_names[j], ns_names[j], MAXDNAME);
   safe_strncpy(parent->async_ns_zone, zone ? zone : "", MAXDNAME);
   parent->async_ns_current = 0;
+  parent->async_ns_phase = 0;
+  if (parent->async_ns_collected)
+    {
+      free_referral_servers(parent->async_ns_collected);
+      parent->async_ns_collected = NULL;
+    }
+  parent->async_ns_min_ttl = 0;
 
+  /* Start with T_A for the first NS name; AAAA follow-ups are issued
+     in async_ns_complete based on parent->async_ns_phase. */
   for (j = 0; j < parent->async_ns_count; j++)
     {
-      cached = deleg_cache_lookup(ns_names[j], now);
-      if (!cached)
-	{
-	  /* Cold-cache fallback: start the sub-resolution at the root
-	     servers so that an unknown NS hostname can still be looked
-	     up without an immediate hard SERVFAIL. */
-	  struct server *srv;
-	  int root_count = 0;
-
-	  for (srv = daemon->servers; srv && root_count < DELEGATION_MAX_ADDRS; srv = srv->next)
-	    if (srv->domain_len == 0 && !(srv->flags & SERV_LITERAL_ADDRESS))
-	      {
-		struct referral_server *rs = whine_malloc(sizeof(struct referral_server));
-		if (!rs)
-		  break;
-		rs->addr = srv->addr;
-		rs->next = cached;
-		cached = rs;
-		root_count++;
-	      }
-
-	  if (!cached)
-	    continue;
-	}
-
-      if (option_bool(OPT_LOG))
-	my_syslog(LOG_INFO, _("recursive: starting async resolution for NS '%s'"),
-		  ns_names[j]);
-
-      memset(&dummy_serv, 0, sizeof(dummy_serv));
-      sub = get_new_frec(now, &dummy_serv, 1);
-      if (!sub)
-	{
-	  free_referral_servers(cached);
-	  return 0;
-	}
-
-      header = (struct dns_header *)daemon->packet;
-      memset(header, 0, sizeof(struct dns_header));
-      sub->new_id = get_id();
-      header->id = htons(sub->new_id);
-      header->hb3 = HB3_RD;
-      header->qdcount = htons(1);
-
-      p = (unsigned char *)(header + 1);
-      p = do_rfc1035_name(p, ns_names[j], NULL);
-      if (!p)
-	{
-	  free_referral_servers(cached);
-	  free_frec(sub);
-	  continue;
-	}
-      *p++ = 0;
-      PUTSHORT(T_A, p);
-      PUTSHORT(C_IN, p);
-      qlen = (size_t)(p - (unsigned char *)header);
-
-      sub->flags = FREC_RECURSIVE | FREC_NS_ASYNC;
-      sub->stash = blockdata_alloc((char *)header, qlen);
-      if (!sub->stash)
-	{
-	  free_referral_servers(cached);
-	  free_frec(sub);
-	  continue;
-	}
-      sub->stash_len = qlen;
-      sub->referral_servers = cached;
-      sub->recursive_iteration = 1;
-      sub->recursive_prev_zone[0] = '\0';
-      sub->cname_chain = NULL;
-      sub->cname_original = NULL;
-      sub->cname_chase_count = 0;
-      sub->async_parent = parent;
-      sub->async_child = NULL;
-      sub->async_ns_count = 0;
-
-      sub->frec_src.fd = -1;
-      sub->frec_src.orig_id = 0;
-      sub->frec_src.log_id = daemon->log_id;
-      sub->frec_src.next = NULL;
-      sub->frec_src.encode_bitmap = (!option_bool(OPT_NO_0x20) && option_bool(OPT_DO_0x20)) ? rand32() : 0;
-      sub->frec_src.encode_bigmap = NULL;
-      if (sub->frec_src.encode_bitmap)
-	extract_name(header, qlen, NULL, (char *)&sub->frec_src.encode_bitmap, EXTR_NAME_FLIP, 1);
-
-      parent->async_child = sub;
       parent->async_ns_current = j;
-
-      if (forward_to_referrals(sub, now))
-	{
-	  daemon->async_ns_in_flight++;
-	  return 1;
-	}
-
-      parent->async_child = NULL;
-      sub->async_parent = NULL;
-      free_frec(sub);
+      if (start_ns_subquery(parent, ns_names[j], T_A, now))
+	return 1;
     }
 
   parent->async_ns_count = 0;
@@ -913,10 +946,74 @@ static int resolve_ns_name_async(struct frec *parent, char ns_names[][MAXDNAME],
   return 0;
 }
 
+/* Resume the parent query after a successful NS name resolution: move
+   the merged referral_server list onto parent->referral_servers and
+   kick off forward_to_referrals, SERVFAILing on failure. */
+static void async_ns_resume_parent(struct frec *parent,
+				    struct referral_server *new_servers,
+				    unsigned long cache_ttl,
+				    time_t now)
+{
+  if (parent->async_ns_zone[0] != '\0')
+    deleg_cache_store(parent->async_ns_zone, new_servers, (time_t)cache_ttl);
+
+  if (parent->referral_servers)
+    free_referral_servers(parent->referral_servers);
+  parent->referral_servers = new_servers;
+  if (parent->recursive_iteration == 0)
+    parent->recursive_iteration = 1;
+
+  {
+    struct dns_header *parent_hdr = blockdata_retrieve(parent->stash, parent->stash_len, NULL);
+    if (parent_hdr)
+      extract_request(parent_hdr, parent->stash_len, daemon->namebuff, NULL, NULL);
+  }
+
+  if (!forward_to_referrals(parent, now))
+    {
+      struct dns_header *err_hdr = (struct dns_header *)daemon->packet;
+      blockdata_retrieve(parent->stash, parent->stash_len, (void *)err_hdr);
+      SET_RCODE(err_hdr, SERVFAIL);
+      err_hdr->ancount = htons(0);
+      err_hdr->nscount = htons(0);
+      err_hdr->arcount = htons(0);
+      err_hdr->hb4 |= HB4_RA;
+      return_reply(now, parent, err_hdr, parent->stash_len, STAT_OK);
+    }
+}
+
+/* Merge a freshly-resolved referral_server list onto the parent's
+   accumulated async_ns_collected list and fold the minimum TTL. The
+   new list is spliced onto the head of async_ns_collected; ownership
+   is transferred. */
+static void async_ns_merge(struct frec *parent,
+			    struct referral_server *fresh,
+			    unsigned long fresh_ttl)
+{
+  if (!fresh)
+    return;
+
+  {
+    struct referral_server *tail = fresh;
+    while (tail->next)
+      tail = tail->next;
+    tail->next = parent->async_ns_collected;
+    parent->async_ns_collected = fresh;
+  }
+
+  if (fresh_ttl)
+    {
+      if (parent->async_ns_min_ttl == 0 || fresh_ttl < parent->async_ns_min_ttl)
+	parent->async_ns_min_ttl = fresh_ttl;
+    }
+}
+
 static void async_ns_complete(struct frec *sub, struct dns_header *header, ssize_t n, time_t now)
 {
   struct frec *parent = sub->async_parent;
   struct referral_server *new_servers = NULL;
+  unsigned long sub_ttl = 0;
+  unsigned short phase;
 
   if (!parent)
     {
@@ -925,62 +1022,81 @@ static void async_ns_complete(struct frec *sub, struct dns_header *header, ssize
       return;
     }
 
+  phase = parent->async_ns_phase;
+
   if (RCODE(header) == NOERROR && ntohs(header->ancount) > 0)
     {
       const char *ns_owner = (parent->async_ns_current >= 0 &&
                               parent->async_ns_current < parent->async_ns_count)
                               ? parent->async_ns_names[parent->async_ns_current]
                               : NULL;
-      new_servers = extract_addresses_from_answer(header, (size_t)n, ns_owner);
+      new_servers = extract_addresses_from_answer(header, (size_t)n, ns_owner, &sub_ttl);
     }
 
-  if (new_servers)
+  /* Tear down the completed sub regardless of outcome; any follow-up
+     sub-query (AAAA phase, or next NS name) creates a fresh sub via
+     start_ns_subquery(). */
+  parent->async_child = NULL;
+  sub->async_parent = NULL;
+  daemon->async_ns_in_flight--;
+  free_frec(sub);
+
+  if (phase == 0)
     {
-      if (parent->async_ns_zone[0] != '\0')
-	deleg_cache_store(parent->async_ns_zone, new_servers, 0);
-
-      if (option_bool(OPT_LOG))
-	my_syslog(LOG_INFO, _("recursive: async NS resolution succeeded for '%s', resuming parent query"),
-		  parent->async_ns_names[parent->async_ns_current]);
-
-      parent->async_child = NULL;
-      sub->async_parent = NULL;
-      daemon->async_ns_in_flight--;
-      free_frec(sub);
-
-      if (parent->referral_servers)
-	free_referral_servers(parent->referral_servers);
-      parent->referral_servers = new_servers;
-      if (parent->recursive_iteration == 0)
-	parent->recursive_iteration = 1;
-
-      {
-	struct dns_header *parent_hdr = blockdata_retrieve(parent->stash, parent->stash_len, NULL);
-	if (parent_hdr)
-	  extract_request(parent_hdr, parent->stash_len, daemon->namebuff, NULL, NULL);
-      }
-
-      if (!forward_to_referrals(parent, now))
+      /* T_A phase completed. Fold the (possibly empty) A answer into
+	 the collected list and launch a follow-up T_AAAA query for the
+	 same NS name so A+AAAA can be merged. */
+      if (new_servers)
 	{
-	  struct dns_header *err_hdr = (struct dns_header *)daemon->packet;
-	  blockdata_retrieve(parent->stash, parent->stash_len, (void *)err_hdr);
-	  SET_RCODE(err_hdr, SERVFAIL);
-	  err_hdr->ancount = htons(0);
-	  err_hdr->nscount = htons(0);
-	  err_hdr->arcount = htons(0);
-	  err_hdr->hb4 |= HB4_RA;
-	  return_reply(now, parent, err_hdr, parent->stash_len, STAT_OK);
+	  if (option_bool(OPT_LOG))
+	    my_syslog(LOG_INFO, _("recursive: async A for '%s' resolved, fetching AAAA"),
+		      parent->async_ns_names[parent->async_ns_current]);
+	  async_ns_merge(parent, new_servers, sub_ttl);
 	}
-      return;
+
+      if (parent->async_ns_current >= 0 &&
+	  parent->async_ns_current < parent->async_ns_count &&
+	  start_ns_subquery(parent, parent->async_ns_names[parent->async_ns_current],
+			    T_AAAA, now))
+	return;
+
+      /* Couldn't start AAAA follow-up. If we already collected A
+	 records, resume the parent with them; otherwise fall through to
+	 next-name / sync fallback. */
+      if (parent->async_ns_collected)
+	{
+	  struct referral_server *merged = parent->async_ns_collected;
+	  unsigned long merged_ttl = parent->async_ns_min_ttl;
+	  parent->async_ns_collected = NULL;
+	  parent->async_ns_min_ttl = 0;
+	  async_ns_resume_parent(parent, merged, merged_ttl, now);
+	  return;
+	}
+    }
+  else
+    {
+      /* T_AAAA phase completed (either A-only or A+AAAA case). Merge
+	 the AAAA result with any previously collected A answers and
+	 resume the parent if anything was found. */
+      async_ns_merge(parent, new_servers, sub_ttl);
+
+      if (parent->async_ns_collected)
+	{
+	  struct referral_server *merged = parent->async_ns_collected;
+	  unsigned long merged_ttl = parent->async_ns_min_ttl;
+	  parent->async_ns_collected = NULL;
+	  parent->async_ns_min_ttl = 0;
+	  if (option_bool(OPT_LOG))
+	    my_syslog(LOG_INFO, _("recursive: async NS resolution succeeded for '%s' (dual-stack), resuming parent query"),
+		      parent->async_ns_names[parent->async_ns_current]);
+	  async_ns_resume_parent(parent, merged, merged_ttl, now);
+	  return;
+	}
     }
 
+  /* Nothing usable for the current NS name - try the next one. */
   {
     int next = parent->async_ns_current + 1;
-
-    parent->async_child = NULL;
-    sub->async_parent = NULL;
-    daemon->async_ns_in_flight--;
-    free_frec(sub);
 
     if (next < parent->async_ns_count)
       {
@@ -1001,38 +1117,14 @@ static void async_ns_complete(struct frec *sub, struct dns_header *header, ssize
 
     {
       int j;
+      sub_ttl = 0;
       for (j = 0; j < parent->async_ns_count && !new_servers; j++)
-	new_servers = resolve_ns_name_sync(parent->async_ns_names[j]);
+	new_servers = resolve_ns_name_sync(parent->async_ns_names[j], &sub_ttl);
     }
 
     if (new_servers)
       {
-	if (parent->async_ns_zone[0] != '\0')
-	  deleg_cache_store(parent->async_ns_zone, new_servers, 0);
-
-	if (parent->referral_servers)
-	  free_referral_servers(parent->referral_servers);
-	parent->referral_servers = new_servers;
-	if (parent->recursive_iteration == 0)
-	  parent->recursive_iteration = 1;
-
-	{
-	  struct dns_header *parent_hdr = blockdata_retrieve(parent->stash, parent->stash_len, NULL);
-	  if (parent_hdr)
-	    extract_request(parent_hdr, parent->stash_len, daemon->namebuff, NULL, NULL);
-	}
-
-	if (!forward_to_referrals(parent, now))
-	  {
-	    struct dns_header *err_hdr = (struct dns_header *)daemon->packet;
-	    blockdata_retrieve(parent->stash, parent->stash_len, (void *)err_hdr);
-	    SET_RCODE(err_hdr, SERVFAIL);
-	    err_hdr->ancount = htons(0);
-	    err_hdr->nscount = htons(0);
-	    err_hdr->arcount = htons(0);
-	    err_hdr->hb4 |= HB4_RA;
-	    return_reply(now, parent, err_hdr, parent->stash_len, STAT_OK);
-	  }
+	async_ns_resume_parent(parent, new_servers, sub_ttl, now);
 	return;
       }
 
@@ -1685,7 +1777,7 @@ void reply_query(int fd, time_t now)
 		      if (option_bool(OPT_LOG))
 			my_syslog(LOG_INFO, _("recursive: no glue for %s, resolving NS '%s' (sync)"),
 				  daemon->namebuff, ns_names[j]);
-		      new_servers = resolve_ns_name_sync(ns_names[j]);
+		      new_servers = resolve_ns_name_sync(ns_names[j], NULL);
 		    }
 
 		  if (!new_servers)
@@ -2096,6 +2188,18 @@ void reply_query(int fd, time_t now)
 	    int anscount = 0;
 	    struct cname_chain *cc;
 	    int j;
+	    unsigned long chain_min_ttl = 0;
+	    int have_chain_ttl = 0;
+
+	    /* Fold the TTL over the whole (possibly hidden) CNAME chain so
+	       that synthesized replies never advertise a longer lifetime
+	       than the shortest TTL of any involved alias hop. */
+	    for (cc = forward->cname_chain; cc; cc = cc->next)
+	      if (!have_chain_ttl || cc->ttl < chain_min_ttl)
+		{
+		  chain_min_ttl = cc->ttl;
+		  have_chain_ttl = 1;
+		}
 
 	    blockdata_retrieve(forward->cname_original, forward->cname_original_len, (void *)combined);
 	    limit = (unsigned char *)combined + daemon->edns_pktsz;
@@ -2134,7 +2238,9 @@ void reply_query(int fd, time_t now)
 
 		      PUTSHORT(T_CNAME, ansp);
 		      PUTSHORT(C_IN, ansp);
-		      PUTLONG(forward->cname_chain->ttl, ansp);
+		      /* Use the chain-wide minimum TTL so the cached alias
+			 cannot outlive its shortest hop. */
+		      PUTLONG(chain_min_ttl, ansp);
 
 		      {
 			unsigned char *rdlen_p = ansp;
@@ -2167,6 +2273,7 @@ void reply_query(int fd, time_t now)
 		for (cc = forward->cname_chain; cc; cc = cc->next)
 		  {
 		    unsigned char *name_start = ansp;
+		    unsigned long emit_ttl;
 
 		    ansp = do_rfc1035_name(ansp, cc->source, (char *)limit);
 		    if (!ansp || ansp + 1 + 10 >= limit)
@@ -2175,7 +2282,10 @@ void reply_query(int fd, time_t now)
 
 		    PUTSHORT(T_CNAME, ansp);
 		    PUTSHORT(C_IN, ansp);
-		    PUTLONG(cc->ttl, ansp);
+		    /* Clamp every link of the expanded chain to the chain
+		       minimum so no hop advertises more than the weakest. */
+		    emit_ttl = (have_chain_ttl && cc->ttl > chain_min_ttl) ? chain_min_ttl : cc->ttl;
+		    PUTLONG(emit_ttl, ansp);
 
 		    {
 		      unsigned char *rdlen_p = ansp;
@@ -2202,9 +2312,15 @@ void reply_query(int fd, time_t now)
 	    for (j = 0; j < rr_count; j++)
 	      {
 		char *rr_name = final_rrs[j].name;
+		unsigned long emit_ttl = final_rrs[j].ttl;
 
 		if (option_bool(OPT_CNAME_FLAT) && forward->cname_chain)
 		  rr_name = forward->cname_chain->source;
+
+		/* Fold the chain TTL into each terminal RR so the cached
+		   answer cannot outlive the shortest CNAME hop. */
+		if (have_chain_ttl && emit_ttl > chain_min_ttl)
+		  emit_ttl = chain_min_ttl;
 
 		ansp = do_rfc1035_name(ansp, rr_name, (char *)limit);
 		if (!ansp || ansp + 1 + 10 + final_rrs[j].rdlen >= limit)
@@ -2213,7 +2329,7 @@ void reply_query(int fd, time_t now)
 
 		PUTSHORT(final_rrs[j].type, ansp);
 		PUTSHORT(C_IN, ansp);
-		PUTLONG(final_rrs[j].ttl, ansp);
+		PUTLONG(emit_ttl, ansp);
 		PUTSHORT(final_rrs[j].rdlen, ansp);
 
 		memcpy(ansp, final_rrs[j].rdata, final_rrs[j].rdlen);
@@ -2412,7 +2528,7 @@ void reply_query(int fd, time_t now)
 	      return;
 
 	    for (j = 0; j < ns_count && !new_servers; j++)
-	      new_servers = resolve_ns_name_sync(ns_names[j]);
+	      new_servers = resolve_ns_name_sync(ns_names[j], NULL);
 	  }
 
 	if (new_servers)
@@ -4279,6 +4395,13 @@ static void free_frec(struct frec *f)
   f->async_parent = NULL;
   f->async_ns_count = 0;
   f->async_ns_zone[0] = '\0';
+  f->async_ns_phase = 0;
+  if (f->async_ns_collected)
+    {
+      free_referral_servers(f->async_ns_collected);
+      f->async_ns_collected = NULL;
+    }
+  f->async_ns_min_ttl = 0;
 
 #ifdef HAVE_DNSSEC
   /* Anything we're waiting on is pointless now, too */

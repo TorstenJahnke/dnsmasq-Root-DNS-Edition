@@ -872,6 +872,9 @@ struct frec {
   char async_ns_names[4][MAXDNAME];
   int async_ns_count;
   int async_ns_current;
+  unsigned short async_ns_phase;            /* 0 = A query in flight, 1 = AAAA query in flight */
+  struct referral_server *async_ns_collected; /* addresses accumulated across A+AAAA sub-queries */
+  unsigned long async_ns_min_ttl;            /* min TTL across accumulated A/AAAA answers */
   struct frec *next;
 };
 
@@ -2033,10 +2036,10 @@ struct referral_server *deleg_cache_lookup(const char *name, time_t now);
 int referral_zone_name(struct dns_header *header, size_t plen, char *zone, size_t zone_len);
 int is_referral(struct dns_header *header, size_t plen);
 struct referral_server *parse_referral(struct dns_header *header, size_t plen, const char *zone, unsigned long *ns_ttl_out);
-struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter);
+struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter, unsigned long *ttl_out);
 void free_referral_servers(struct referral_server *servers);
 int recursive_validate_source(struct frec *forward, union mysockaddr *addr);
-struct referral_server *resolve_ns_name_sync(const char *ns_name);
+struct referral_server *resolve_ns_name_sync(const char *ns_name, unsigned long *ttl_out);
 int extract_referral_ns_names(struct dns_header *header, size_t plen,
                               char ns_names[][MAXDNAME], int max_names);
 int extract_cname_target(struct dns_header *header, size_t plen,

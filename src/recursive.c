@@ -100,7 +100,7 @@ void deleg_cache_store(const char *zone, struct referral_server *servers, time_t
   if (!entry)
     {
       /* Before allocating a new entry, purge any expired entries
-	 in this bucket to prevent unbounded memory growth (M1). */
+	 in this bucket to prevent unbounded memory growth. */
       struct delegation_entry **ep;
       time_t now = time(NULL);
       for (ep = &daemon->deleg_cache[h]; *ep; )
@@ -1108,19 +1108,24 @@ struct referral_server *parse_referral(struct dns_header *header, size_t plen, c
 }
 
 /* Build a minimal DNS query packet for the given name and type.
-   Returns the packet length, or 0 on failure. */
+   Returns the packet length, or 0 on failure.
+   Always appends an EDNS(0) OPT RR announcing a 4096-byte UDP payload
+   size so that authoritative servers may return large referrals or
+   answers without forcing truncation. */
 static size_t build_dns_query(unsigned char *buf, size_t buflen, const char *name, unsigned short qtype)
 {
   struct dns_header *header = (struct dns_header *)buf;
   unsigned char *p;
 
-  if (buflen < sizeof(struct dns_header) + strlen(name) + 2 + 4)
+  /* Reserve space for header + question + EDNS OPT RR (11 bytes). */
+  if (buflen < sizeof(struct dns_header) + strlen(name) + 2 + 4 + 11)
     return 0;
 
   memset(header, 0, sizeof(struct dns_header));
   header->id = htons(rand16());
   header->hb3 = 0;  /* No RD - iterative query */
   header->qdcount = htons(1);
+  header->arcount = htons(1);
 
   p = (unsigned char *)(header + 1);
   p = do_rfc1035_name(p, name, NULL);
@@ -1131,19 +1136,113 @@ static size_t build_dns_query(unsigned char *buf, size_t buflen, const char *nam
   PUTSHORT(qtype, p);
   PUTSHORT(C_IN, p);
 
+  /* EDNS(0) OPT RR: root name, TYPE=OPT, CLASS=UDP payload size,
+     TTL=extended rcode+version+flags, RDLEN=0. */
+  *p++ = 0;                 /* root name */
+  PUTSHORT(T_OPT, p);       /* type */
+  PUTSHORT(4096, p);        /* UDP payload size */
+  *p++ = 0;                 /* extended rcode */
+  *p++ = 0;                 /* version */
+  PUTSHORT(0, p);           /* flags */
+  PUTSHORT(0, p);           /* rdlen */
+
   return (size_t)(p - buf);
+}
+
+/* Send a DNS query over TCP to the given server and read a single
+   length-prefixed response. Used as a TCP fallback when a UDP response
+   sets the TC bit. Uses a per-stage poll budget of roughly one second
+   and closes the socket unconditionally. Returns the response length
+   on success or -1 on any failure. */
+static ssize_t tcp_ns_query(union mysockaddr *addr,
+                            unsigned char *query, size_t qlen,
+                            unsigned char *resp, size_t respcap)
+{
+  int fd;
+  struct pollfd pfd;
+  unsigned char lenbuf[2];
+  ssize_t got;
+  uint16_t rlen;
+  size_t total;
+
+  if (qlen > 0xffff || respcap < sizeof(struct dns_header))
+    return -1;
+
+  fd = socket(addr->sa.sa_family, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (fd == -1)
+    return -1;
+
+  if (connect(fd, &addr->sa, sa_len(addr)) == -1 && errno != EINPROGRESS)
+    {
+      close(fd);
+      return -1;
+    }
+
+  pfd.fd = fd;
+  pfd.events = POLLOUT;
+  { int pr; do pr = poll(&pfd, 1, 1000); while (pr == -1 && errno == EINTR);
+    if (pr <= 0 || !(pfd.revents & POLLOUT)) { close(fd); return -1; }
+  }
+
+  {
+    int err = 0;
+    socklen_t sl = sizeof(err);
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &sl) == -1 || err != 0)
+      { close(fd); return -1; }
+  }
+
+  lenbuf[0] = (unsigned char)(qlen >> 8);
+  lenbuf[1] = (unsigned char)(qlen & 0xff);
+
+  pfd.events = POLLOUT;
+  if (send(fd, lenbuf, 2, MSG_NOSIGNAL) != 2)
+    { close(fd); return -1; }
+  if (send(fd, query, qlen, MSG_NOSIGNAL) != (ssize_t)qlen)
+    { close(fd); return -1; }
+
+  pfd.events = POLLIN;
+  { int pr; do pr = poll(&pfd, 1, 1000); while (pr == -1 && errno == EINTR);
+    if (pr <= 0 || !(pfd.revents & POLLIN)) { close(fd); return -1; }
+  }
+  got = recv(fd, lenbuf, 2, 0);
+  if (got != 2)
+    { close(fd); return -1; }
+  rlen = ((uint16_t)lenbuf[0] << 8) | lenbuf[1];
+  if (rlen == 0 || rlen > respcap)
+    { close(fd); return -1; }
+
+  total = 0;
+  while (total < rlen)
+    {
+      pfd.events = POLLIN;
+      { int pr; do pr = poll(&pfd, 1, 1000); while (pr == -1 && errno == EINTR);
+        if (pr <= 0 || !(pfd.revents & POLLIN)) { close(fd); return -1; }
+      }
+      got = recv(fd, resp + total, rlen - total, 0);
+      if (got <= 0)
+        { close(fd); return -1; }
+      total += (size_t)got;
+    }
+
+  close(fd);
+  return (ssize_t)rlen;
 }
 
 /* Extract A/AAAA addresses from the answer section of a DNS response.
    Returns a referral_server list, or NULL if no addresses found.
    If owner_filter is non-NULL, only addresses whose owner name exactly
    matches owner_filter are accepted. Pass NULL for unfiltered behaviour. */
-struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter)
+struct referral_server *extract_addresses_from_answer(struct dns_header *header, size_t plen, const char *owner_filter, unsigned long *ttl_out)
 {
   unsigned char *p;
   int i;
   struct referral_server *servers = NULL;
   int count = 0;
+  unsigned long min_ttl = 0;
+  int have_ttl = 0;
+
+  if (ttl_out)
+    *ttl_out = 0;
 
   if (RCODE(header) != NOERROR || ntohs(header->ancount) == 0)
     return NULL;
@@ -1154,6 +1253,7 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
   for (i = 0; i < ntohs(header->ancount) && count < DELEGATION_MAX_ADDRS; i++)
     {
       unsigned short type, rdlen;
+      unsigned long rr_ttl;
       char name[MAXDNAME];
 
       if (!extract_name(header, plen, &p, name, EXTR_NAME_EXTRACT, 10))
@@ -1161,7 +1261,7 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
 
       GETSHORT(type, p);
       p += 2; /* class */
-      p += 4; /* TTL */
+      GETLONG(rr_ttl, p);
       GETSHORT(rdlen, p);
 
       if (((type == T_A && rdlen == INADDRSZ) || (type == T_AAAA && rdlen == IN6ADDRSZ)) &&
@@ -1190,6 +1290,12 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
                 rs->next = servers;
                 servers = rs;
                 count++;
+
+                if (!have_ttl || rr_ttl < min_ttl)
+                  {
+                    min_ttl = rr_ttl;
+                    have_ttl = 1;
+                  }
               }
           }
         }
@@ -1197,6 +1303,9 @@ struct referral_server *extract_addresses_from_answer(struct dns_header *header,
       if (!ADD_RDLEN(header, p, plen, rdlen))
         break;
     }
+
+  if (ttl_out && have_ttl)
+    *ttl_out = min_ttl;
 
   return servers;
 }
@@ -1226,9 +1335,16 @@ static struct referral_server *build_root_server_list(void)
 
 /* Core of the synchronous NS-name resolver, parameterised on the query
    type. Tries the delegation cache, falls back to the root servers on
-   miss, then iterates referrals until it gets a definitive answer or
-   runs out of iterations. */
-static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsigned short qtype)
+   miss, then iterates referrals until it gets a definitive answer,
+   runs out of iterations, or exceeds its wall-clock deadline.
+
+   Bounded by a hard 2-second total deadline so that blocking the main
+   forwarding loop on unreachable authoritatives stays within a
+   tolerable worst case. Queries include an EDNS(0) OPT RR and fall
+   back to TCP when the UDP response has the TC bit set. The minimum
+   TTL of accepted A/AAAA answers is exposed via ttl_out for downstream
+   delegation-cache TTL propagation. */
+static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsigned short qtype, unsigned long *ttl_out)
 {
   struct referral_server *target_servers, *rs;
   ALIGNED(sizeof(u16)) unsigned char query_buf[1280];
@@ -1236,6 +1352,13 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
   size_t qlen;
   int iteration;
   time_t now = time(NULL);
+  struct timespec deadline;
+
+  if (ttl_out)
+    *ttl_out = 0;
+
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += 2;  /* hard 2s total wall-clock budget */
 
   qlen = build_dns_query(query_buf, sizeof(query_buf), ns_name, qtype);
   if (!qlen)
@@ -1262,9 +1385,25 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
       ssize_t n = 0;
       struct dns_header *resp_header;
       int got_response = 0;
+      struct timespec ts_now;
+
+      clock_gettime(CLOCK_MONOTONIC, &ts_now);
+      if (ts_now.tv_sec > deadline.tv_sec ||
+          (ts_now.tv_sec == deadline.tv_sec && ts_now.tv_nsec >= deadline.tv_nsec))
+        break;
 
       for (rs = target_servers; rs && !got_response; rs = rs->next)
         {
+          long rem_ms;
+
+          clock_gettime(CLOCK_MONOTONIC, &ts_now);
+          rem_ms = (deadline.tv_sec - ts_now.tv_sec) * 1000L
+                 + (deadline.tv_nsec - ts_now.tv_nsec) / 1000000L;
+          if (rem_ms <= 0)
+            break;
+          if (rem_ms > 250)
+            rem_ms = 250;
+
           fd = socket(rs->addr.sa.sa_family, SOCK_DGRAM | SOCK_NONBLOCK, 0);
           if (fd == -1)
             continue;
@@ -1280,7 +1419,7 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
           pfd.fd = fd;
           pfd.events = POLLIN;
           { int poll_ret;
-            do poll_ret = poll(&pfd, 1, 250); while (poll_ret == -1 && errno == EINTR);
+            do poll_ret = poll(&pfd, 1, (int)rem_ms); while (poll_ret == -1 && errno == EINTR);
           if (poll_ret > 0 && (pfd.revents & POLLIN))
             {
               union mysockaddr from_addr;
@@ -1300,6 +1439,28 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
           }
 
           close(fd);
+
+          /* If the response was truncated, retry the same server over
+             TCP to obtain the full answer. */
+          if (got_response)
+            {
+              struct dns_header *rh = (struct dns_header *)resp_buf;
+              if (rh->hb3 & HB3_TC)
+                {
+                  ssize_t tn = tcp_ns_query(&rs->addr, query_buf, qlen,
+                                            resp_buf, sizeof(resp_buf));
+                  if (tn >= (ssize_t)sizeof(struct dns_header))
+                    {
+                      struct dns_header *th = (struct dns_header *)resp_buf;
+                      if (th->id == ((struct dns_header *)query_buf)->id)
+                        n = tn;
+                      else
+                        got_response = 0;
+                    }
+                  else
+                    got_response = 0;
+                }
+            }
         }
 
       if (!got_response)
@@ -1312,7 +1473,7 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
 
       if (RCODE(resp_header) == NOERROR && ntohs(resp_header->ancount) > 0)
         {
-          struct referral_server *result = extract_addresses_from_answer(resp_header, (size_t)n, ns_name);
+          struct referral_server *result = extract_addresses_from_answer(resp_header, (size_t)n, ns_name, ttl_out);
           free_referral_servers(target_servers);
           return result;
         }
@@ -1353,26 +1514,55 @@ static struct referral_server *resolve_ns_name_qtype(const char *ns_name, unsign
 /* Synchronously resolve an NS name by sending iterative UDP queries.
    Uses the delegation cache (or root-server fallback) for starting
    servers, follows referrals, returns resolved addresses as a
-   referral_server list. Tries IPv4 first, then IPv6 on miss, so that
-   IPv6-only NS hostnames are reachable.
-   This handles the out-of-bailiwick case where a delegation response
-   contains NS records (e.g., ns1.google.com) but no glue records
-   because the NS names are outside the delegated zone. */
-struct referral_server *resolve_ns_name_sync(const char *ns_name)
+   referral_server list.
+
+   Queries both A and AAAA and returns a merged list so that IPv4 and
+   IPv6 addresses of the same NS hostname are always cached and tried
+   together. The effective TTL is the minimum across both address
+   families. Total wall-clock budget is at most 4 seconds (2s per
+   query type). Handles the out-of-bailiwick case where a delegation
+   response contains NS records (e.g., ns1.google.com) but no glue
+   because the NS name is outside the delegated zone. */
+struct referral_server *resolve_ns_name_sync(const char *ns_name, unsigned long *ttl_out)
 {
-  struct referral_server *result;
+  struct referral_server *a_result, *aaaa_result, *merged;
+  unsigned long a_ttl = 0, aaaa_ttl = 0;
+
+  if (ttl_out)
+    *ttl_out = 0;
 
   if (option_bool(OPT_LOG))
     my_syslog(LOG_INFO, _("recursive: resolving out-of-bailiwick NS name '%s'"), ns_name);
 
-  result = resolve_ns_name_qtype(ns_name, T_A);
-  if (!result)
-    result = resolve_ns_name_qtype(ns_name, T_AAAA);
+  a_result    = resolve_ns_name_qtype(ns_name, T_A,    &a_ttl);
+  aaaa_result = resolve_ns_name_qtype(ns_name, T_AAAA, &aaaa_ttl);
 
-  if (result && option_bool(OPT_LOG))
+  if (!a_result && !aaaa_result)
+    return NULL;
+
+  /* Splice both lists; aaaa_result is prepended onto a_result. */
+  merged = a_result;
+  if (aaaa_result)
+    {
+      struct referral_server *tail = aaaa_result;
+      while (tail->next)
+        tail = tail->next;
+      tail->next = merged;
+      merged = aaaa_result;
+    }
+
+  if (ttl_out)
+    {
+      if (a_ttl && aaaa_ttl)
+        *ttl_out = (a_ttl < aaaa_ttl) ? a_ttl : aaaa_ttl;
+      else
+        *ttl_out = a_ttl ? a_ttl : aaaa_ttl;
+    }
+
+  if (option_bool(OPT_LOG))
     my_syslog(LOG_INFO, _("recursive: resolved NS name '%s' successfully"), ns_name);
 
-  return result;
+  return merged;
 }
 
 /* Extract NS target names from the authority section of a referral response.
